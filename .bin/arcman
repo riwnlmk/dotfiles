@@ -29,21 +29,20 @@ send_message() {
     CURRENT_TIME=$(date +"%I:%M %p")
 
     # Create a formatted message that includes the collected system information
-    MESSAGE="System: $DISTRO
-Kernel: $KERNEL
-Hostname: $HOSTNAME
-Username: $USERNAME
-Date: $CURRENT_DATE
-Time: $CURRENT_TIME
-Upgrade Status: Success
-Upgraded Packages: $PACKAGES"
+    MESSAGE="<b>System</b>: $DISTRO
+<b>Kernel</b>: $KERNEL
+<b>Hostname</b>: $HOSTNAME
+<b>Username</b>: $USERNAME
+<b>Date</b>: $CURRENT_DATE
+<b>Time</b>: $CURRENT_TIME
+
+<pre>$PACKAGES</pre>"
 
     # Use curl to send the message to Telegram, suppressing the terminal output
     curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
          -d "chat_id=$CHAT_ID" \
+         -d "parse_mode=HTML" \
          -d "text=$MESSAGE" > /dev/null 2>&1
-
-    echo $MESSAGE
 }
 
 # The following command fetches the latest mirrorlist from the Arch Linux website
