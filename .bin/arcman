@@ -9,6 +9,19 @@ TG_LOG="${LOG_DIR}/tg_send.log"
 PACMAN_LOG="$(mktemp)"
 PREVIEW_LIMIT=50
 
+try_load_env() {
+  if [[ -f "${HOME}/.arcmanenv" ]]; then
+    source "${HOME}/.arcmanenv"
+  fi
+  if [[ -n "${SUDO_USER:-}" && -f "/home/${SUDO_USER}/.arcmanenv" ]]; then
+    source "/home/${SUDO_USER}/.arcmanenv"
+  fi
+  if [[ -f "/etc/environment" ]]; then
+    source /etc/environment 2>/dev/null || true
+  fi
+}
+try_load_env
+
 BOT_TOKEN="${TG_BOT_TOKEN:-}"
 CHAT_ID="${TG_CHAT_ID:-}"
 
