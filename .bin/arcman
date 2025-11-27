@@ -3,56 +3,231 @@
 # Author: Md. Ridwanul Islam Muntakim
 # Email Address: riwnlmk@gmail.com
 
-send_message() {
-    # Define your Telegram bot's token here
-    BOT_TOKEN="YOUR_BOT_TOKEN_HERE"
+set -u
+LOG_DIR="/tmp"
+TG_LOG="${LOG_DIR}/tg_send.log"
+PACMAN_LOG="$(mktemp)"
+PREVIEW_LIMIT=50
 
-    # Define the chat ID where the message will be sent
-    CHAT_ID="YOUR_CHAT_ID_HERE"
-    
-    # Get the distribution name (e.g. Arch Linux, Manjaro) using lsb_release or fallback to /etc/*release
-    DISTRO=$(lsb_release -ds 2>/dev/null || cat /etc/*release | grep -E '^NAME=' | awk -F= '{print $2}' | tr -d '"')
+BOT_TOKEN="${TG_BOT_TOKEN:-}"
+CHAT_ID="${TG_CHAT_ID:-}"
 
-    # Get the kernel version using the uname command
-    KERNEL=$(uname -r)
+DISTRO="$(lsb_release -ds 2>/dev/null || awk -F= '/^NAME=/{print $2}' /etc/*release 2>/dev/null | head -n1 | tr -d '"' )"
+DISTRO="${DISTRO:-Unknown}"
 
-    # Get the system's hostname, using 'hostname' command or fallback to 'uname -n'
-    HOSTNAME=$(hostname 2>/dev/null || uname -n)
+KERNEL="$(uname -r 2>/dev/null || true)"
+KERNEL="${KERNEL:-Unknown}"
 
-    # Get the current user's username
-    USERNAME=$(whoami)
+HOSTNAME="$(hostname 2>/dev/null || uname -n 2>/dev/null || true)"
+HOSTNAME="${HOSTNAME:-Unknown}"
 
-    # Get the current date
-    CURRENT_DATE=$(date +"%a %b %d, %Y")
+USERNAME="$(whoami 2>/dev/null || true)"
+USERNAME="${USERNAME:-Unknown}"
 
-    # Get the current time
-    CURRENT_TIME=$(date +"%I:%M %p")
-    
-    # Create a formatted message that includes the collected system information
-    MESSAGE="System: $DISTRO
-Kernel: $KERNEL
-Hostname: $HOSTNAME
-Username: $USERNAME
-Date: $CURRENT_DATE
-Time: $CURRENT_TIME
-Upgrade Status: Success"
-    
-    # Use curl to send the message to Telegram, suppressing the terminal output
-    curl -s -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
-         -d "chat_id=$CHAT_ID" \
-         -d "text=$MESSAGE" > /dev/null 2>&1
+CURRENT_DATE="$(date +"%a %b %d, %Y" 2>/dev/null || true)"
+CURRENT_DATE="${CURRENT_DATE:-Unknown}"
+
+CURRENT_TIME="$(date +"%I:%M %p" 2>/dev/null || true)"
+CURRENT_TIME="${CURRENT_TIME:-Unknown}"
+
+escape_md_v2() {
+  local s="$1"
+  printf '%s' "$s" | sed \
+    -e 's/\\/\\\\\\/g' \
+    -e 's/_/\\_/g' \
+    -e 's/\*/\\*/g' \
+    -e 's/\[/\\[/g' \
+    -e 's/\]/\\]/g' \
+    -e 's/(/\\(/g' \
+    -e 's/)/\\)/g' \
+    -e 's/~/\\~/g' \
+    -e 's/`/\\`/g' \
+    -e 's/>/\\>/g' \
+    -e 's/#/\\#/g' \
+    -e 's/+/\\+/g' \
+    -e 's/-/\\-/g' \
+    -e 's/=/\\=/g' \
+    -e 's/|/\\|/g' \
+    -e 's/{/\\{/g' \
+    -e 's/}/\\}/g' \
+    -e 's/\./\\./g' \
+    -e 's/!/\\!/g'
 }
 
-# The following command fetches the latest mirrorlist from the Arch Linux website
-curl -s "https://archlinux.org/mirrorlist/?country=all&protocol=http&protocol=https&ip_version=4&use_mirror_status=on" | \
-    # The 'sed' command is used to uncomment the lines starting with '#Server' to activate the server list
-    sed '0,/^#Server/ s/^#//' | 
-    # The 'tee' command writes the modified mirrorlist to the /etc/pacman.d/mirrorlist file with elevated privileges
-    sudo tee /etc/pacman.d/mirrorlist > /dev/null  
+send_message() {
+  local text="$1"
+  local max_retries=3
+  local attempt=1
+  : > "$TG_LOG" 2>/dev/null || true
 
-# Prints a success message indicating the mirror list has been updated
-echo -e "Mirrorlist updated successfully!"
+  if [[ -z "${BOT_TOKEN:-}" || -z "${CHAT_ID:-}" ]]; then
+    echo "ERROR: BOT_TOKEN or CHAT_ID empty. Cannot send Telegram message." | tee -a "$TG_LOG"
+    return 2
+  fi
 
-# The following command synchronizes the package databases and upgrades the system packages
-sudo pacman -Syu
-send_message
+  while (( attempt <= max_retries )); do
+    resp="$(curl -s -w "\n%{http_code}" -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+      -d "chat_id=${CHAT_ID}" \
+      -d "parse_mode=MarkdownV2" \
+      --data-urlencode "text=${text}")" || resp=""
+
+    http_code="$(echo "$resp" | tail -n1)"
+    body="$(echo "$resp" | sed '$d')"
+
+    {
+      echo "---- $(date --iso-8601=seconds) attempt #$attempt ----"
+      echo "HTTP_CODE: ${http_code}"
+      echo "BODY: ${body}"
+      echo "----------------------------------------"
+    } >> "$TG_LOG"
+
+    if [[ "$http_code" == "200" ]]; then
+      return 0
+    fi
+
+    if [[ "$http_code" =~ ^4[0-9][0-9]$ && "$http_code" != "429" ]]; then
+      echo "Telegram rejected request (HTTP $http_code). See $TG_LOG"
+      return 3
+    fi
+
+    sleep $((attempt * 2))
+    attempt=$((attempt + 1))
+  done
+
+  echo "Failed to send message after ${max_retries} attempts. See $TG_LOG"
+  return 1
+}
+
+curl -s "https://archlinux.org/mirrorlist/?country=all&protocol=https&protocol=http&ip_version=4&use_mirror_status=on" | \
+  sed '0,/^#Server/ s/^#//' |
+  sudo tee /etc/pacman.d/mirrorlist > /dev/null
+
+echo "Mirrorlist updated successfully!"
+
+BEFORE_LIST="$(pacman -Qu 2>/dev/null | awk '{print $1}' | sort)"
+if [[ -z "$BEFORE_LIST" ]]; then
+  BEFORE_COUNT=0
+else
+  BEFORE_COUNT=$(echo "$BEFORE_LIST" | wc -l)
+fi
+
+sudo pacman -Syu > "$PACMAN_LOG" 2>&1
+PACMAN_EXIT=$?
+
+if [[ $PACMAN_EXIT -ne 0 ]]; then
+  PACMAN_TAIL="$(tail -n 200 "$PACMAN_LOG")"
+
+  eDISTRO="$(escape_md_v2 "$DISTRO")"
+  eKERNEL="$(escape_md_v2 "$KERNEL")"
+  eHOST="$(escape_md_v2 "$HOSTNAME")"
+  eUSER="$(escape_md_v2 "$USERNAME")"
+  eDATE="$(escape_md_v2 "$CURRENT_DATE")"
+  eTIME="$(escape_md_v2 "$CURRENT_TIME")"
+
+  read -r -d '' FAIL_MSG <<EOF || true
+*System:* ${eDISTRO}
+*Kernel:* ${eKERNEL}
+*Host:* ${eHOST}
+*User:* ${eUSER}
+*Date:* ${eDATE}
+*Time:* ${eTIME}
+
+\`\`\`shell
+${PACMAN_TAIL}
+\`\`\`
+EOF
+
+  send_message "$FAIL_MSG" || {
+    echo "Failed to send failure report to Telegram. Check $TG_LOG"
+  }
+
+  echo "Pacman failed. Full output saved at: $PACMAN_LOG"
+  exit $PACMAN_EXIT
+fi
+
+AFTER_LIST="$(pacman -Qu 2>/dev/null | awk '{print $1}' | sort)"
+if [[ -z "$AFTER_LIST" ]]; then
+  AFTER_COUNT=0
+else
+  AFTER_COUNT=$(echo "$AFTER_LIST" | wc -l)
+fi
+
+if [[ $BEFORE_COUNT -gt 0 ]]; then
+  UPDATED_NAMES="$(comm -23 <(echo "$BEFORE_LIST") <(echo "$AFTER_LIST"))"
+  UPDATED_NAMES="$(echo "$UPDATED_NAMES" | sed '/^\s*$/d')"
+  if [[ -z "$UPDATED_NAMES" ]]; then
+    UPDATED_COUNT=0
+  else
+    UPDATED_COUNT=$(echo "$UPDATED_NAMES" | wc -l)
+  fi
+else
+  UPDATED_NAMES=""
+  UPDATED_COUNT=0
+fi
+
+if [[ $UPDATED_COUNT -gt 0 ]]; then
+  PREVIEW="$(echo "$UPDATED_NAMES" | sed -n "1,${PREVIEW_LIMIT}p")"
+  MORE=""
+  if [[ $(echo "$UPDATED_NAMES" | wc -l) -gt $PREVIEW_LIMIT ]]; then
+    MORE="\n... (and more)"
+  fi
+else
+  PREVIEW="No packages were updated."
+  MORE=""
+fi
+
+eDISTRO="$(escape_md_v2 "${DISTRO:-Unknown}")"
+eKERNEL="$(escape_md_v2 "${KERNEL:-Unknown}")"
+eHOST="$(escape_md_v2 "${HOSTNAME:-Unknown}")"
+eUSER="$(escape_md_v2 "${USERNAME:-Unknown}")"
+eDATE="$(escape_md_v2 "${CURRENT_DATE:-Unknown}")"
+eTIME="$(escape_md_v2 "${CURRENT_TIME:-Unknown}")"
+eBEFORE="$(escape_md_v2 "${BEFORE_COUNT:-0}")"
+eAFTER="$(escape_md_v2 "${AFTER_COUNT:-0}")"
+eUPDATED="$(escape_md_v2 "${UPDATED_COUNT:-0}")"
+
+read -r -d '' MESSAGE <<EOF || true
+*System:* ${eDISTRO}
+*Kernel:* ${eKERNEL}
+*Host:* ${eHOST}
+*User:* ${eUSER}
+*Date:* ${eDATE}
+*Time:* ${eTIME}
+*Previously upgradeable:* ${eBEFORE}
+*Remaining upgradeable after run:* ${eAFTER}
+*Packages actually updated:* ${eUPDATED}
+
+\`\`\`shell
+${PREVIEW}${MORE}
+\`\`\`
+EOF
+
+if send_message "$MESSAGE"; then
+  echo "Telegram notification sent successfully."
+else
+  echo "Telegram notification failed. Check $TG_LOG for details."
+fi
+
+echo "----- Local summary -----"
+echo "System: ${DISTRO}"
+echo "Kernel: ${KERNEL}"
+echo "Host: ${HOSTNAME}"
+echo "User: ${USERNAME}"
+echo "Date: ${CURRENT_DATE}"
+echo "Time: ${CURRENT_TIME}"
+echo "Previously upgradeable: ${BEFORE_COUNT}"
+echo "Remaining upgradeable after run: ${AFTER_COUNT}"
+echo "Packages actually updated: ${UPDATED_COUNT}"
+if [[ $UPDATED_COUNT -gt 0 ]]; then
+  echo -e "\nUpdated packages (preview ${PREVIEW_LIMIT}):"
+  echo "$PREVIEW"
+  if [[ -n "$MORE" ]]; then
+    echo -e "\n... (and more)"
+  fi
+else
+  echo -e "\nNo packages were updated."
+fi
+
+echo ""
+echo "Pacman full log: $PACMAN_LOG"
+echo "Telegram send log: $TG_LOG"
