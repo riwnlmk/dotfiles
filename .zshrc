@@ -18,3 +18,6 @@ export PATH="$PATH:$HOME/.bin"
 
 # Source custom aliases from the .aliases file
 source $HOME/.aliases
+
+# Source the user's custom environment variables from the .arcenv file
+source $HOME/.arcenv
