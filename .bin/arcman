@@ -6,7 +6,7 @@
 set -u
 LOG_DIR="/tmp"
 TG_LOG="${LOG_DIR}/tg_send.log"
-PACMAN_LOG="$(mktemp)"
+PACMAN_LOG="$(mktemp "${LOG_DIR}/pacman.XXXXXX")"
 PREVIEW_LIMIT=50
 
 try_load_env() {
@@ -27,21 +27,11 @@ CHAT_ID="${TG_CHAT_ID:-}"
 
 DISTRO="$(lsb_release -ds 2>/dev/null || awk -F= '/^NAME=/{print $2}' /etc/*release 2>/dev/null | head -n1 | tr -d '"' )"
 DISTRO="${DISTRO:-Unknown}"
-
-KERNEL="$(uname -r 2>/dev/null || true)"
-KERNEL="${KERNEL:-Unknown}"
-
-HOSTNAME="$(hostname 2>/dev/null || uname -n 2>/dev/null || true)"
-HOSTNAME="${HOSTNAME:-Unknown}"
-
-USERNAME="$(whoami 2>/dev/null || true)"
-USERNAME="${USERNAME:-Unknown}"
-
-CURRENT_DATE="$(date +"%a %b %d, %Y" 2>/dev/null || true)"
-CURRENT_DATE="${CURRENT_DATE:-Unknown}"
-
-CURRENT_TIME="$(date +"%I:%M %p" 2>/dev/null || true)"
-CURRENT_TIME="${CURRENT_TIME:-Unknown}"
+KERNEL="$(uname -r 2>/dev/null || true)"; KERNEL="${KERNEL:-Unknown}"
+HOSTNAME="$(hostname 2>/dev/null || uname -n 2>/dev/null || true)"; HOSTNAME="${HOSTNAME:-Unknown}"
+USERNAME="$(whoami 2>/dev/null || true)"; USERNAME="${USERNAME:-Unknown}"
+CURRENT_DATE="$(date +"%a %b %d, %Y" 2>/dev/null || true)"; CURRENT_DATE="${CURRENT_DATE:-Unknown}"
+CURRENT_TIME="$(date +"%I:%M %p" 2>/dev/null || true)"; CURRENT_TIME="${CURRENT_TIME:-Unknown}"
 
 escape_md_v2() {
   local s="$1"
@@ -79,11 +69,13 @@ send_message() {
   fi
 
   while (( attempt <= max_retries )); do
+    local resp
     resp="$(curl -s -w "\n%{http_code}" -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
       -d "chat_id=${CHAT_ID}" \
       -d "parse_mode=MarkdownV2" \
       --data-urlencode "text=${text}")" || resp=""
 
+    local http_code body
     http_code="$(echo "$resp" | tail -n1)"
     body="$(echo "$resp" | sed '$d')"
 
@@ -99,7 +91,7 @@ send_message() {
     fi
 
     if [[ "$http_code" =~ ^4[0-9][0-9]$ && "$http_code" != "429" ]]; then
-      echo "Telegram rejected request (HTTP $http_code). See $TG_LOG"
+      echo "Telegram rejected request (HTTP $http_code). See $TG_LOG" | tee -a "$TG_LOG"
       return 3
     fi
 
@@ -107,29 +99,34 @@ send_message() {
     attempt=$((attempt + 1))
   done
 
-  echo "Failed to send message after ${max_retries} attempts. See $TG_LOG"
+  echo "Failed to send message after ${max_retries} attempts. See $TG_LOG" | tee -a "$TG_LOG"
   return 1
 }
 
-curl -s "https://archlinux.org/mirrorlist/?country=all&protocol=https&protocol=http&ip_version=4&use_mirror_status=on" | \
-  sed '0,/^#Server/ s/^#//' |
-  sudo tee /etc/pacman.d/mirrorlist > /dev/null
-
-echo "Mirrorlist updated successfully!"
-
-BEFORE_LIST="$(pacman -Qu 2>/dev/null | awk '{print $1}' | sort)"
-if [[ -z "$BEFORE_LIST" ]]; then
+mapfile -t BEFORE_PKGS < <(pacman -Qu 2>/dev/null | awk '{print $1}' || true)
+if [[ ${#BEFORE_PKGS[@]} -eq 0 ]]; then
   BEFORE_COUNT=0
 else
-  BEFORE_COUNT=$(echo "$BEFORE_LIST" | wc -l)
+  BEFORE_COUNT=${#BEFORE_PKGS[@]}
 fi
 
-sudo pacman -Syu > "$PACMAN_LOG" 2>&1
-PACMAN_EXIT=$?
+declare -A OLD_VER
+for pkg in "${BEFORE_PKGS[@]}"; do
+  v="$(pacman -Qi "$pkg" 2>/dev/null | awk -F': ' '/Version/{print $2; exit}')"
+  OLD_VER["$pkg"]="${v:-unknown}"
+done
+
+sudo bash -lc '
+  set -e
+  curl -s "https://archlinux.org/mirrorlist/?country=all&protocol=https&protocol=http&ip_version=4&use_mirror_status=on" \
+    | sed "0,/^#Server/ s/^#//" > /etc/pacman.d/mirrorlist && echo "Mirrorlist updated successfully!"
+  # Force TTY for pacman; output flows to stdout of this block
+  script -qefc "pacman -Syu" /dev/null
+' | tee "$PACMAN_LOG"
+PACMAN_EXIT=${PIPESTATUS[0]:-1}
 
 if [[ $PACMAN_EXIT -ne 0 ]]; then
-  PACMAN_TAIL="$(tail -n 200 "$PACMAN_LOG")"
-
+  PACMAN_TAIL="$(tail -n 300 "$PACMAN_LOG" 2>/dev/null || true)"
   eDISTRO="$(escape_md_v2 "$DISTRO")"
   eKERNEL="$(escape_md_v2 "$KERNEL")"
   eHOST="$(escape_md_v2 "$HOSTNAME")"
@@ -150,42 +147,48 @@ ${PACMAN_TAIL}
 \`\`\`
 EOF
 
-  send_message "$FAIL_MSG" || {
-    echo "Failed to send failure report to Telegram. Check $TG_LOG"
-  }
-
+  send_message "$FAIL_MSG" || echo "Failed to send failure report to Telegram. Check $TG_LOG"
   echo "Pacman failed. Full output saved at: $PACMAN_LOG"
   exit $PACMAN_EXIT
 fi
 
-AFTER_LIST="$(pacman -Qu 2>/dev/null | awk '{print $1}' | sort)"
-if [[ -z "$AFTER_LIST" ]]; then
+mapfile -t AFTER_PKGS < <(pacman -Qu 2>/dev/null | awk '{print $1}' || true)
+if [[ ${#AFTER_PKGS[@]} -eq 0 ]]; then
   AFTER_COUNT=0
 else
-  AFTER_COUNT=$(echo "$AFTER_LIST" | wc -l)
+  AFTER_COUNT=${#AFTER_PKGS[@]}
 fi
 
-if [[ $BEFORE_COUNT -gt 0 ]]; then
-  UPDATED_NAMES="$(comm -23 <(echo "$BEFORE_LIST") <(echo "$AFTER_LIST"))"
-  UPDATED_NAMES="$(echo "$UPDATED_NAMES" | sed '/^\s*$/d')"
-  if [[ -z "$UPDATED_NAMES" ]]; then
-    UPDATED_COUNT=0
-  else
-    UPDATED_COUNT=$(echo "$UPDATED_NAMES" | wc -l)
-  fi
-else
-  UPDATED_NAMES=""
-  UPDATED_COUNT=0
+UPDATED_NAMES="$(comm -23 <(printf '%s\n' "${BEFORE_PKGS[@]}" | sort) <(printf '%s\n' "${AFTER_PKGS[@]}" | sort) || true)"
+UPDATED_INFO=""
+UPDATED_COUNT=0
+
+if [[ -n "$UPDATED_NAMES" ]]; then
+  while IFS= read -r pkg; do
+    [[ -z "$pkg" ]] && continue
+    newv="$(pacman -Qi "$pkg" 2>/dev/null | awk -F': ' '/Version/{print $2; exit}')"
+    oldv="${OLD_VER[$pkg]:-unknown}"
+    if [[ -z "$newv" ]]; then
+      UPDATED_INFO+="${pkg} : ${oldv} -> removed\n"
+    else
+      UPDATED_INFO+="${pkg} ${oldv} -> ${newv}\n"
+    fi
+    UPDATED_COUNT=$((UPDATED_COUNT + 1))
+  done <<< "$UPDATED_NAMES"
+fi
+
+if [[ -z "${UPDATED_INFO// /}" ]]; then
+  UPDATED_INFO="No packages were updated."
 fi
 
 if [[ $UPDATED_COUNT -gt 0 ]]; then
-  PREVIEW="$(echo "$UPDATED_NAMES" | sed -n "1,${PREVIEW_LIMIT}p")"
+  PREVIEW="$(printf '%b' "$UPDATED_INFO" | sed -n "1,${PREVIEW_LIMIT}p" || true)"
   MORE=""
-  if [[ $(echo "$UPDATED_NAMES" | wc -l) -gt $PREVIEW_LIMIT ]]; then
+  if [[ $(printf '%b' "$UPDATED_INFO" | wc -l) -gt $PREVIEW_LIMIT ]]; then
     MORE="\n... (and more)"
   fi
 else
-  PREVIEW="No packages were updated."
+  PREVIEW="${UPDATED_INFO}"
   MORE=""
 fi
 
@@ -231,9 +234,10 @@ echo "Time: ${CURRENT_TIME}"
 echo "Previously upgradeable: ${BEFORE_COUNT}"
 echo "Remaining upgradeable after run: ${AFTER_COUNT}"
 echo "Packages actually updated: ${UPDATED_COUNT}"
+
 if [[ $UPDATED_COUNT -gt 0 ]]; then
   echo -e "\nUpdated packages (preview ${PREVIEW_LIMIT}):"
-  echo "$PREVIEW"
+  printf '%b\n' "$PREVIEW"
   if [[ -n "$MORE" ]]; then
     echo -e "\n... (and more)"
   fi
