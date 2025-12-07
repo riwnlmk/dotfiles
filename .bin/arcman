@@ -4,10 +4,12 @@
 # Email Address: riwnlmk@gmail.com
 
 set -u
+
 LOG_DIR="/tmp"
 TG_LOG="${LOG_DIR}/tg_send.log"
 PACMAN_LOG="$(mktemp "${LOG_DIR}/pacman.XXXXXX")"
 PREVIEW_LIMIT=50
+SYS_PACMAN_LOG="/var/log/pacman.log"
 
 try_load_env() {
   if [[ -f "${HOME}/.arcmanenv" ]]; then
@@ -103,30 +105,21 @@ send_message() {
   return 1
 }
 
-mapfile -t BEFORE_PKGS < <(pacman -Qu 2>/dev/null | awk '{print $1}' || true)
-if [[ ${#BEFORE_PKGS[@]} -eq 0 ]]; then
-  BEFORE_COUNT=0
-else
-  BEFORE_COUNT=${#BEFORE_PKGS[@]}
-fi
-
-declare -A OLD_VER
-for pkg in "${BEFORE_PKGS[@]}"; do
-  v="$(pacman -Qi "$pkg" 2>/dev/null | awk -F': ' '/Version/{print $2; exit}')"
-  OLD_VER["$pkg"]="${v:-unknown}"
-done
+PACLOG_BEFORE_LINES="$(wc -l < "$SYS_PACMAN_LOG" 2>/dev/null || echo 0)"
 
 sudo bash -lc '
   set -e
   curl -s "https://archlinux.org/mirrorlist/?country=all&protocol=https&protocol=http&ip_version=4&use_mirror_status=on" \
-    | sed "0,/^#Server/ s/^#//" > /etc/pacman.d/mirrorlist && echo "Mirrorlist updated successfully!"
-  # Force TTY for pacman; output flows to stdout of this block
+    | sed "0,/^#Server/ s/^#//" > /etc/pacman.d/mirrorlist &&
+  echo "Mirrorlist updated successfully!"
   script -qefc "pacman -Syu" /dev/null
 ' | tee "$PACMAN_LOG"
+
 PACMAN_EXIT=${PIPESTATUS[0]:-1}
 
 if [[ $PACMAN_EXIT -ne 0 ]]; then
   PACMAN_TAIL="$(tail -n 300 "$PACMAN_LOG" 2>/dev/null || true)"
+
   eDISTRO="$(escape_md_v2 "$DISTRO")"
   eKERNEL="$(escape_md_v2 "$KERNEL")"
   eHOST="$(escape_md_v2 "$HOSTNAME")"
@@ -152,40 +145,40 @@ EOF
   exit $PACMAN_EXIT
 fi
 
-mapfile -t AFTER_PKGS < <(pacman -Qu 2>/dev/null | awk '{print $1}' || true)
-if [[ ${#AFTER_PKGS[@]} -eq 0 ]]; then
-  AFTER_COUNT=0
-else
-  AFTER_COUNT=${#AFTER_PKGS[@]}
+PACLOG_AFTER_LINES="$(wc -l < "$SYS_PACMAN_LOG" 2>/dev/null || echo 0)"
+
+NEW_LOG=""
+if (( PACLOG_AFTER_LINES > PACLOG_BEFORE_LINES )); then
+  NEW_LOG="$(tail -n "$((PACLOG_AFTER_LINES - PACLOG_BEFORE_LINES))" "$SYS_PACMAN_LOG" 2>/dev/null || true)"
 fi
 
-UPDATED_NAMES="$(comm -23 <(printf '%s\n' "${BEFORE_PKGS[@]}" | sort) <(printf '%s\n' "${AFTER_PKGS[@]}" | sort) || true)"
-UPDATED_INFO=""
-UPDATED_COUNT=0
+UPDATED_INFO="$(printf '%s\n' "$NEW_LOG" | awk '
+  /\[ALPM\] upgraded / {
+    pkg=$4
+    old=$5
+    new=$7
+    gsub(/[\(\)]/, "", old)
+    gsub(/[\(\)]/, "", new)
+    print pkg, old, "->", new
+  }
+')"
+UPDATED_INFO="$(printf '%s\n' "$UPDATED_INFO" | sed '/^\s*$/d')"
 
-if [[ -n "$UPDATED_NAMES" ]]; then
-  while IFS= read -r pkg; do
-    [[ -z "$pkg" ]] && continue
-    newv="$(pacman -Qi "$pkg" 2>/dev/null | awk -F': ' '/Version/{print $2; exit}')"
-    oldv="${OLD_VER[$pkg]:-unknown}"
-    if [[ -z "$newv" ]]; then
-      UPDATED_INFO+="${pkg} : ${oldv} -> removed\n"
-    else
-      UPDATED_INFO+="${pkg} ${oldv} -> ${newv}\n"
-    fi
-    UPDATED_COUNT=$((UPDATED_COUNT + 1))
-  done <<< "$UPDATED_NAMES"
-fi
-
-if [[ -z "${UPDATED_INFO// /}" ]]; then
+if [[ -z "$UPDATED_INFO" ]]; then
+  UPDATED_COUNT=0
   UPDATED_INFO="No packages were updated."
+else
+  UPDATED_COUNT=$(printf '%s\n' "$UPDATED_INFO" | wc -l)
 fi
+
+BEFORE_COUNT=$UPDATED_COUNT
+AFTER_COUNT=0
 
 if [[ $UPDATED_COUNT -gt 0 ]]; then
-  PREVIEW="$(printf '%b' "$UPDATED_INFO" | sed -n "1,${PREVIEW_LIMIT}p" || true)"
+  PREVIEW="$(printf '%s\n' "$UPDATED_INFO" | sed -n "1,${PREVIEW_LIMIT}p" || true)"
   MORE=""
-  if [[ $(printf '%b' "$UPDATED_INFO" | wc -l) -gt $PREVIEW_LIMIT ]]; then
-    MORE="\n... (and more)"
+  if [[ $(printf '%s\n' "$UPDATED_INFO" | wc -l) -gt $PREVIEW_LIMIT ]]; then
+    MORE=$'\n... (and more)'
   fi
 else
   PREVIEW="${UPDATED_INFO}"
@@ -201,6 +194,8 @@ eTIME="$(escape_md_v2 "${CURRENT_TIME:-Unknown}")"
 eBEFORE="$(escape_md_v2 "${BEFORE_COUNT:-0}")"
 eAFTER="$(escape_md_v2 "${AFTER_COUNT:-0}")"
 eUPDATED="$(escape_md_v2 "${UPDATED_COUNT:-0}")"
+ePREVIEW="$(escape_md_v2 "${PREVIEW}")"
+eMORE="$(escape_md_v2 "${MORE}")"
 
 read -r -d '' MESSAGE <<EOF || true
 *System:* ${eDISTRO}
@@ -214,7 +209,7 @@ read -r -d '' MESSAGE <<EOF || true
 *Packages actually updated:* ${eUPDATED}
 
 \`\`\`shell
-${PREVIEW}${MORE}
+${ePREVIEW}${eMORE}
 \`\`\`
 EOF
 
@@ -237,7 +232,7 @@ echo "Packages actually updated: ${UPDATED_COUNT}"
 
 if [[ $UPDATED_COUNT -gt 0 ]]; then
   echo -e "\nUpdated packages (preview ${PREVIEW_LIMIT}):"
-  printf '%b\n' "$PREVIEW"
+  printf '%s\n' "$UPDATED_INFO" | sed -n "1,${PREVIEW_LIMIT}p"
   if [[ -n "$MORE" ]]; then
     echo -e "\n... (and more)"
   fi
