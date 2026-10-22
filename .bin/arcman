@@ -3,243 +3,105 @@
 # Author: Md. Ridwanul Islam Muntakim
 # Email Address: riwnlmk@gmail.com
 
-set -u
+set -uo pipefail
 
-LOG_DIR="/tmp"
-TG_LOG="${LOG_DIR}/tg_send.log"
-PACMAN_LOG="$(mktemp "${LOG_DIR}/pacman.XXXXXX")"
+ENV_FILE="${HOME}/.arcmanenv"
+COUNTRIES="Bangladesh,India,Singapore"
+MIRROR_COUNT=10
 PREVIEW_LIMIT=50
-SYS_PACMAN_LOG="/var/log/pacman.log"
+SYS_LOG="/var/log/pacman.log"
+OUT_LOG="$(mktemp /tmp/pacman.XXXXXX)"
+TG_LOG="/tmp/tg_send.log"
 
-try_load_env() {
-  if [[ -f "${HOME}/.arcmanenv" ]]; then
-    source "${HOME}/.arcmanenv"
-  fi
-  if [[ -n "${SUDO_USER:-}" && -f "/home/${SUDO_USER}/.arcmanenv" ]]; then
-    source "/home/${SUDO_USER}/.arcmanenv"
-  fi
-  if [[ -f "/etc/environment" ]]; then
-    source /etc/environment 2>/dev/null || true
-  fi
-}
-try_load_env
-
+[[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 BOT_TOKEN="${TG_BOT_TOKEN:-}"
 CHAT_ID="${TG_CHAT_ID:-}"
 
-DISTRO="$(lsb_release -ds 2>/dev/null || awk -F= '/^NAME=/{print $2}' /etc/*release 2>/dev/null | head -n1 | tr -d '"' )"
-DISTRO="${DISTRO:-Unknown}"
-KERNEL="$(uname -r 2>/dev/null || true)"; KERNEL="${KERNEL:-Unknown}"
-HOSTNAME="$(hostname 2>/dev/null || uname -n 2>/dev/null || true)"; HOSTNAME="${HOSTNAME:-Unknown}"
-USERNAME="$(whoami 2>/dev/null || true)"; USERNAME="${USERNAME:-Unknown}"
-CURRENT_DATE="$(date +"%a %b %d, %Y" 2>/dev/null || true)"; CURRENT_DATE="${CURRENT_DATE:-Unknown}"
-CURRENT_TIME="$(date +"%I:%M %p" 2>/dev/null || true)"; CURRENT_TIME="${CURRENT_TIME:-Unknown}"
+esc() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 
-escape_md_v2() {
-  local s="$1"
-  printf '%s' "$s" | sed \
-    -e 's/\\/\\\\\\/g' \
-    -e 's/_/\\_/g' \
-    -e 's/\*/\\*/g' \
-    -e 's/\[/\\[/g' \
-    -e 's/\]/\\]/g' \
-    -e 's/(/\\(/g' \
-    -e 's/)/\\)/g' \
-    -e 's/~/\\~/g' \
-    -e 's/`/\\`/g' \
-    -e 's/>/\\>/g' \
-    -e 's/#/\\#/g' \
-    -e 's/+/\\+/g' \
-    -e 's/-/\\-/g' \
-    -e 's/=/\\=/g' \
-    -e 's/|/\\|/g' \
-    -e 's/{/\\{/g' \
-    -e 's/}/\\}/g' \
-    -e 's/\./\\./g' \
-    -e 's/!/\\!/g'
+strip_ansi() { sed -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/\r//g'; }
+
+send_telegram() {
+  if [[ -z "$BOT_TOKEN" || -z "$CHAT_ID" ]]; then
+    echo "Telegram: TG_BOT_TOKEN / TG_CHAT_ID not set, skipping."
+    return 1
+  fi
+
+  local distro kernel msg
+  distro="$(awk -F'"' '/^PRETTY_NAME=/{print $2}' /etc/os-release)"
+  kernel="$(uname -r)"
+
+  local body
+  body="$(printf '%s' "$2" | strip_ansi | tail -c 2800)"
+
+  msg="<b>$(esc "$1")</b>
+<b>Kernel:</b> $(esc "$kernel")
+<b>Host:</b> $(esc "$(uname -n)")
+<b>User:</b> $(esc "$USER")
+<b>Time:</b> $(esc "$(date '+%a %b %d, %Y %I:%M %p')")
+
+<pre><code class=\"language-shell\">$(esc "$body")</code></pre>"
+
+  if curl -sS --fail-with-body --retry 3 --retry-delay 2 --max-time 20 \
+       -o "$TG_LOG" "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+       -d "chat_id=${CHAT_ID}" -d "parse_mode=HTML" \
+       --data-urlencode "text=${msg}"; then
+    echo "Telegram notification sent."
+  else
+    echo "Telegram notification failed. See $TG_LOG"
+    return 1
+  fi
 }
 
-send_message() {
-  local text="$1"
-  local max_retries=3
-  local attempt=1
-  : > "$TG_LOG" 2>/dev/null || true
+sudo -v || exit 1
 
-  if [[ -z "${BOT_TOKEN:-}" || -z "${CHAT_ID:-}" ]]; then
-    echo "ERROR: BOT_TOKEN or CHAT_ID empty. Cannot send Telegram message." | tee -a "$TG_LOG"
-    return 2
-  fi
-
-  while (( attempt <= max_retries )); do
-    local resp
-    resp="$(curl -s -w "\n%{http_code}" -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-      -d "chat_id=${CHAT_ID}" \
-      -d "parse_mode=MarkdownV2" \
-      --data-urlencode "text=${text}")" || resp=""
-
-    local http_code body
-    http_code="$(echo "$resp" | tail -n1)"
-    body="$(echo "$resp" | sed '$d')"
-
-    {
-      echo "---- $(date --iso-8601=seconds) attempt #$attempt ----"
-      echo "HTTP_CODE: ${http_code}"
-      echo "BODY: ${body}"
-      echo "----------------------------------------"
-    } >> "$TG_LOG"
-
-    if [[ "$http_code" == "200" ]]; then
-      return 0
-    fi
-
-    if [[ "$http_code" =~ ^4[0-9][0-9]$ && "$http_code" != "429" ]]; then
-      echo "Telegram rejected request (HTTP $http_code). See $TG_LOG" | tee -a "$TG_LOG"
-      return 3
-    fi
-
-    sleep $((attempt * 2))
-    attempt=$((attempt + 1))
-  done
-
-  echo "Failed to send message after ${max_retries} attempts. See $TG_LOG" | tee -a "$TG_LOG"
-  return 1
+echo "==> Updating mirrorlist with reflector (speed test, may take 1-2 minutes)..."
+MIRROR_TMP="$(mktemp /tmp/mirrorlist.XXXXXX)"
+try_reflector() {
+  reflector --verbose --latest "$MIRROR_COUNT" --protocol https --age 12 \
+            --country "$COUNTRIES" --save "$MIRROR_TMP" "$@" \
+    && [[ -s "$MIRROR_TMP" ]]
 }
 
-PACLOG_BEFORE_LINES="$(wc -l < "$SYS_PACMAN_LOG" 2>/dev/null || echo 0)"
-
-sudo bash -lc '
-  set -e
-  curl -s "https://archlinux.org/mirrorlist/?country=all&protocol=https&protocol=http&ip_version=4&use_mirror_status=on" \
-    | sed "0,/^#Server/ s/^#//" > /etc/pacman.d/mirrorlist &&
-  echo "Mirrorlist updated successfully!"
-  script -qefc "pacman -Syu" /dev/null
-' | tee "$PACMAN_LOG"
-
-PACMAN_EXIT=${PIPESTATUS[0]:-1}
-
-if [[ $PACMAN_EXIT -ne 0 ]]; then
-  PACMAN_TAIL="$(tail -n 300 "$PACMAN_LOG" 2>/dev/null || true)"
-
-  eDISTRO="$(escape_md_v2 "$DISTRO")"
-  eKERNEL="$(escape_md_v2 "$KERNEL")"
-  eHOST="$(escape_md_v2 "$HOSTNAME")"
-  eUSER="$(escape_md_v2 "$USERNAME")"
-  eDATE="$(escape_md_v2 "$CURRENT_DATE")"
-  eTIME="$(escape_md_v2 "$CURRENT_TIME")"
-
-  read -r -d '' FAIL_MSG <<EOF || true
-*System:* ${eDISTRO}
-*Kernel:* ${eKERNEL}
-*Host:* ${eHOST}
-*User:* ${eUSER}
-*Date:* ${eDATE}
-*Time:* ${eTIME}
-
-\`\`\`shell
-${PACMAN_TAIL}
-\`\`\`
-EOF
-
-  send_message "$FAIL_MSG" || echo "Failed to send failure report to Telegram. Check $TG_LOG"
-  echo "Pacman failed. Full output saved at: $PACMAN_LOG"
-  exit $PACMAN_EXIT
-fi
-
-PACLOG_AFTER_LINES="$(wc -l < "$SYS_PACMAN_LOG" 2>/dev/null || echo 0)"
-
-NEW_LOG=""
-if (( PACLOG_AFTER_LINES > PACLOG_BEFORE_LINES )); then
-  NEW_LOG="$(tail -n "$((PACLOG_AFTER_LINES - PACLOG_BEFORE_LINES))" "$SYS_PACMAN_LOG" 2>/dev/null || true)"
-fi
-
-UPDATED_INFO="$(printf '%s\n' "$NEW_LOG" | awk '
-  /\[ALPM\] upgraded / {
-    pkg=$4
-    old=$5
-    new=$7
-    gsub(/[\(\)]/, "", old)
-    gsub(/[\(\)]/, "", new)
-    print pkg, old, "->", new
-  }
-')"
-UPDATED_INFO="$(printf '%s\n' "$UPDATED_INFO" | sed '/^\s*$/d')"
-
-if [[ -z "$UPDATED_INFO" ]]; then
-  UPDATED_COUNT=0
-  UPDATED_INFO="No packages were updated."
+if try_reflector --sort rate --download-timeout 20 \
+   || { echo "Speed test failed, falling back to score sort..."; try_reflector --sort score; }; then
+  sudo cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.bak
+  sudo install -m 644 "$MIRROR_TMP" /etc/pacman.d/mirrorlist
+  echo "Mirrorlist updated."
 else
-  UPDATED_COUNT=$(printf '%s\n' "$UPDATED_INFO" | wc -l)
+  echo "Reflector failed, keeping the existing mirrorlist."
+fi
+rm -f "$MIRROR_TMP"
+
+echo "==> Running pacman -Syu..."
+LOG_START="$(wc -l < "$SYS_LOG" 2>/dev/null || echo 0)"
+
+sudo script -qefc "pacman -Syu" /dev/null | tee "$OUT_LOG"
+PACMAN_EXIT="${PIPESTATUS[0]}"
+
+if (( PACMAN_EXIT != 0 )); then
+  send_telegram "Pacman upgrade FAILED" "$(tail -n 100 "$OUT_LOG")"
+  echo "Pacman failed (exit $PACMAN_EXIT). Full output: $OUT_LOG"
+  exit "$PACMAN_EXIT"
 fi
 
-BEFORE_COUNT=$UPDATED_COUNT
-AFTER_COUNT=0
+mapfile -t UPDATED < <(
+  tail -n +"$((LOG_START + 1))" "$SYS_LOG" 2>/dev/null \
+    | sed -n 's/.*\[ALPM\] upgraded \(.*\) (\(.*\) -> \(.*\))$/\1 \2 -> \3/p'
+)
+COUNT="${#UPDATED[@]}"
 
-if [[ $UPDATED_COUNT -gt 0 ]]; then
-  PREVIEW="$(printf '%s\n' "$UPDATED_INFO" | sed -n "1,${PREVIEW_LIMIT}p" || true)"
-  MORE=""
-  if [[ $(printf '%s\n' "$UPDATED_INFO" | wc -l) -gt $PREVIEW_LIMIT ]]; then
-    MORE=$'\n... (and more)'
-  fi
+if (( COUNT == 0 )); then
+  LIST="No packages were updated."
 else
-  PREVIEW="${UPDATED_INFO}"
-  MORE=""
+  LIST="$(printf '%s\n' "${UPDATED[@]}" | head -n "$PREVIEW_LIMIT")"
+  (( COUNT > PREVIEW_LIMIT )) && LIST+=$'\n... and '"$((COUNT - PREVIEW_LIMIT))"' more'
 fi
 
-eDISTRO="$(escape_md_v2 "${DISTRO:-Unknown}")"
-eKERNEL="$(escape_md_v2 "${KERNEL:-Unknown}")"
-eHOST="$(escape_md_v2 "${HOSTNAME:-Unknown}")"
-eUSER="$(escape_md_v2 "${USERNAME:-Unknown}")"
-eDATE="$(escape_md_v2 "${CURRENT_DATE:-Unknown}")"
-eTIME="$(escape_md_v2 "${CURRENT_TIME:-Unknown}")"
-eBEFORE="$(escape_md_v2 "${BEFORE_COUNT:-0}")"
-eAFTER="$(escape_md_v2 "${AFTER_COUNT:-0}")"
-eUPDATED="$(escape_md_v2 "${UPDATED_COUNT:-0}")"
-ePREVIEW="$(escape_md_v2 "${PREVIEW}")"
-eMORE="$(escape_md_v2 "${MORE}")"
+send_telegram "Upgrade complete: ${COUNT} package(s)" "$LIST"
 
-read -r -d '' MESSAGE <<EOF || true
-*System:* ${eDISTRO}
-*Kernel:* ${eKERNEL}
-*Host:* ${eHOST}
-*User:* ${eUSER}
-*Date:* ${eDATE}
-*Time:* ${eTIME}
-*Previously upgradeable:* ${eBEFORE}
-*Remaining upgradeable after run:* ${eAFTER}
-*Packages actually updated:* ${eUPDATED}
-
-\`\`\`shell
-${ePREVIEW}${eMORE}
-\`\`\`
-EOF
-
-if send_message "$MESSAGE"; then
-  echo "Telegram notification sent successfully."
-else
-  echo "Telegram notification failed. Check $TG_LOG for details."
-fi
-
-echo "----- Local summary -----"
-echo "System: ${DISTRO}"
-echo "Kernel: ${KERNEL}"
-echo "Host: ${HOSTNAME}"
-echo "User: ${USERNAME}"
-echo "Date: ${CURRENT_DATE}"
-echo "Time: ${CURRENT_TIME}"
-echo "Previously upgradeable: ${BEFORE_COUNT}"
-echo "Remaining upgradeable after run: ${AFTER_COUNT}"
-echo "Packages actually updated: ${UPDATED_COUNT}"
-
-if [[ $UPDATED_COUNT -gt 0 ]]; then
-  echo -e "\nUpdated packages (preview ${PREVIEW_LIMIT}):"
-  printf '%s\n' "$UPDATED_INFO" | sed -n "1,${PREVIEW_LIMIT}p"
-  if [[ -n "$MORE" ]]; then
-    echo -e "\n... (and more)"
-  fi
-else
-  echo -e "\nNo packages were updated."
-fi
-
-echo ""
-echo "Pacman full log: $PACMAN_LOG"
-echo "Telegram send log: $TG_LOG"
+echo "----- Summary -----"
+echo "Host: $(uname -n)"
+echo "Packages updated: $COUNT"
+echo "$LIST"
+echo "Pacman output log: $OUT_LOG"
